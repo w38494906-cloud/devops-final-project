@@ -1,0 +1,136 @@
+name: CI/CD (rykov)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "students/rykov/**"
+      - ".github/workflows/rykov-ci-cd.yml"
+  workflow_dispatch:
+
+env:
+  APP_DIR: students/rykov
+  IMAGE: ${{ secrets.DOCKER_USERNAME }}/book-catalog
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: students/rykov
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: students/rykov/package-lock.json
+
+      - run: npm ci
+      - run: npm test
+
+  docker:
+    name: Build and push image
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.APP_DIR }}
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  infra:
+    name: Terraform apply
+    needs: docker
+    runs-on: ubuntu-latest
+    outputs:
+      instance_ip: ${{ steps.out.outputs.instance_ip }}
+    defaults:
+      run:
+        working-directory: students/rykov/infra
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Public key from private key
+        run: |
+          echo "${{ secrets.EC2_SSH_KEY_B64 }}" | base64 -d > key.pem
+          chmod 600 key.pem
+          echo "TF_VAR_public_key=$(ssh-keygen -y -f key.pem)" >> "$GITHUB_ENV"
+          rm key.pem
+
+      - run: terraform init -input=false -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}"
+      - run: terraform fmt -check
+      - run: terraform validate
+      - run: terraform plan -input=false -out=tfplan
+      - run: terraform apply -input=false -auto-approve tfplan
+
+      - id: out
+        run: echo "instance_ip=$(terraform output -raw instance_ip)" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Deploy to EC2
+    needs: infra
+    runs-on: ubuntu-latest
+    env:
+      HOST: ${{ needs.infra.outputs.instance_ip }}
+    steps:
+      - name: SSH key
+        run: |
+          echo "${{ secrets.EC2_SSH_KEY_B64 }}" | base64 -d > key.pem
+          chmod 600 key.pem
+
+      - name: Wait for SSH and Docker
+        run: |
+          for i in $(seq 1 30); do
+            if ssh -i key.pem -o StrictHostKeyChecking=no -o ConnectTimeout=5 ubuntu@$HOST \
+                 'sudo docker info' > /dev/null 2>&1; then
+              echo "Server is ready"; exit 0
+            fi
+            echo "Waiting for server... ($i)"; sleep 10
+          done
+          echo "Server is not ready"; exit 1
+
+      - name: Run container
+        run: |
+          ssh -i key.pem -o StrictHostKeyChecking=no ubuntu@$HOST "
+            set -e
+            sudo docker pull $IMAGE:$GITHUB_SHA
+            sudo docker rm -f book-catalog || true
+            sudo docker run -d --name book-catalog --restart unless-stopped \
+              -p 80:3000 -e APP_VERSION=$GITHUB_SHA $IMAGE:$GITHUB_SHA
+            sudo docker image prune -f
+          "
+
+      - name: Health check
+        run: |
+          for i in $(seq 1 10); do
+            if curl -fs http://$HOST/health; then echo; echo "Deployed: http://$HOST"; exit 0; fi
+            sleep 5
+          done
+          exit 1
+
+      - if: always()
+        run: rm -f key.pem
