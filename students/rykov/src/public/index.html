@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Каталог книг</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; }
+    li { margin: 6px 0; }
+    form { margin-top: 24px; display: flex; gap: 8px; flex-wrap: wrap; }
+    input { padding: 6px; }
+  </style>
+</head>
+<body>
+  <h1>Каталог книг</h1>
+  <input id="search" placeholder="Пошук за назвою або автором">
+  <ul id="list"></ul>
+
+  <form id="add">
+    <input name="title" placeholder="Назва" required>
+    <input name="author" placeholder="Автор" required>
+    <input name="year" placeholder="Рік" type="number">
+    <button>Додати</button>
+  </form>
+
+  <script>
+    const list = document.getElementById('list');
+
+    async function load(q = '') {
+      const res = await fetch('/api/books?q=' + encodeURIComponent(q));
+      const books = await res.json();
+      list.innerHTML = '';
+      for (const b of books) {
+        const li = document.createElement('li');
+        li.textContent = `${b.title} - ${b.author}` + (b.year ? ` (${b.year})` : '');
+        list.appendChild(li);
+      }
+    }
+
+    document.getElementById('search').addEventListener('input', (e) => load(e.target.value));
+
+    document.getElementById('add').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const data = Object.fromEntries(new FormData(e.target));
+      await fetch('/api/books', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      });
+      e.target.reset();
+      load();
+    });
+
+    load();
+  </script>
+</body>
+</html>
