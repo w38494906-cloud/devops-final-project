@@ -1,0 +1,4 @@
+# Скопіюйте у terraform.tfvars для локального запуску
+aws_region    = "us-east-1"
+instance_type = "t2.micro"
+public_key    = "ssh-ed25519 AAAA... your-key"
